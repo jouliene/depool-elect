@@ -7,6 +7,8 @@ use minik2::{
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, sleep};
@@ -16,8 +18,8 @@ const ONE: u128 = 1_000_000_000;
 const BASECHAIN: i8 = 0;
 const DEPOOL_WORKCHAIN: i8 = 0;
 const DEFAULT_CONFIG_PATH: &str = "~/.tycho/depool-elect-config.json";
-const DEFAULT_MIN_STAKE: &str = "10";
-const DEFAULT_VALIDATOR_ASSURANCE: &str = "5000";
+const DEFAULT_MIN_STAKE: &str = "100";
+const DEFAULT_VALIDATOR_ASSURANCE: &str = "10000";
 const DEFAULT_PARTICIPANT_REWARD_FRACTION: u8 = 95;
 const DEFAULT_PARTICIPATE_VALUE: &str = "1";
 const DEFAULT_TICKTOCK_VALUE: &str = "1";
@@ -62,6 +64,7 @@ async fn main() -> Result<()> {
         }
         Command::Status => status(&cli.config_path).await,
         Command::Once => run_once(&cli.config_path).await,
+        Command::MigrateConfig => migrate_config(&cli.config_path),
         Command::Loop => loop {
             if let Err(e) = run_once(&cli.config_path).await {
                 log(format!("ERROR: {e:#}"));
@@ -89,6 +92,7 @@ enum Command {
     },
     Status,
     Once,
+    MigrateConfig,
     Loop,
 }
 
@@ -146,6 +150,7 @@ impl Cli {
                 }
                 "status" => command = Some(Command::Status),
                 "once" => command = Some(Command::Once),
+                "migrate-config" => command = Some(Command::MigrateConfig),
                 "loop" => command = Some(Command::Loop),
                 "help" | "--help" | "-h" => {
                     print_help();
@@ -181,6 +186,7 @@ fn print_help() {
                          [--node-keys PATH]
   depool-elect status [--config PATH]
   depool-elect once [--config PATH]
+  depool-elect migrate-config [--config PATH]
   depool-elect loop [--config PATH]
 
 Defaults:
@@ -205,6 +211,24 @@ fn arg_path(args: &[String], index: usize, name: &str) -> Result<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppConfig {
     endpoint: String,
+    node_keys: KeyFile,
+    validator_wallet: KeyFile,
+    depool_keys: KeyFile,
+    depool_address: String,
+    min_stake: String,
+    validator_assurance: String,
+    target_stake: Option<String>,
+    participant_reward_fraction: u8,
+    stake_factor: u32,
+    participate_value: String,
+    ticktock_value: String,
+    wallet_reserve: String,
+    retry: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyAppConfig {
+    endpoint: String,
     node_keys_path: PathBuf,
     validator_wallet_path: PathBuf,
     depool_keys_path: PathBuf,
@@ -218,6 +242,52 @@ struct AppConfig {
     ticktock_value: String,
     wallet_reserve: String,
     retry: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AppConfigFile {
+    Current(AppConfig),
+    Legacy(LegacyAppConfig),
+}
+
+impl LegacyAppConfig {
+    fn into_current(self) -> Result<AppConfig> {
+        Ok(AppConfig {
+            endpoint: self.endpoint,
+            node_keys: KeyFile::load(&self.node_keys_path)?,
+            validator_wallet: KeyFile::load(&self.validator_wallet_path)?,
+            depool_keys: KeyFile::load(&self.depool_keys_path)?,
+            depool_address: self.depool_address,
+            min_stake: self.min_stake,
+            validator_assurance: self.validator_assurance,
+            target_stake: self.target_stake,
+            participant_reward_fraction: self.participant_reward_fraction,
+            stake_factor: self.stake_factor,
+            participate_value: self.participate_value,
+            ticktock_value: self.ticktock_value,
+            wallet_reserve: self.wallet_reserve,
+            retry: self.retry,
+        })
+    }
+}
+
+fn load_config(config_path: &Path) -> Result<AppConfig> {
+    let data = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config {}", config_path.display()))?;
+    let config: AppConfigFile = serde_json::from_str(&data)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    match config {
+        AppConfigFile::Current(config) => Ok(config),
+        AppConfigFile::Legacy(config) => config.into_current(),
+    }
+}
+
+fn migrate_config(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    write_json(config_path, &config)?;
+    log(format!("migrated config={}", config_path.display()));
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,10 +312,6 @@ impl KeyFile {
         let data = fs::read_to_string(path)
             .with_context(|| format!("failed to read key file {}", path.display()))?;
         serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
-    }
-
-    fn write(&self, path: &Path) -> Result<()> {
-        write_json(path, self)
     }
 
     fn keypair(&self) -> Result<KeyPair> {
@@ -277,22 +343,11 @@ async fn init_new(
     }
 
     let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let validator_wallet_path = base_dir.join("depool-elect-validator-wallet.json");
-    let depool_keys_path = base_dir.join("depool-elect-depool.json");
-
     let default_node_keys_path = base_dir.join("node_keys.json");
-    let generated_node_keys_path = base_dir.join("depool-elect-node_keys.json");
-    let (node_keys_path, generated_node_keys) = match node_keys_path {
-        Some(path) => (path, None),
-        None if default_node_keys_path.exists() => (default_node_keys_path, None),
-        None => {
-            let keys = KeyFile::generate();
-            (generated_node_keys_path, Some(keys))
-        }
-    };
-    let node_keys = match &generated_node_keys {
-        Some(keys) => keys.clone(),
-        None => KeyFile::load(&node_keys_path)?,
+    let node_keys = match node_keys_path {
+        Some(path) => KeyFile::load(&path)?,
+        None if default_node_keys_path.exists() => KeyFile::load(&default_node_keys_path)?,
+        None => KeyFile::generate(),
     };
     let validator_wallet = KeyFile::generate();
     let depool_keys = KeyFile::generate();
@@ -304,9 +359,9 @@ async fn init_new(
 
     let config = AppConfig {
         endpoint: DEFAULT_ENDPOINT.to_owned(),
-        node_keys_path,
-        validator_wallet_path,
-        depool_keys_path,
+        node_keys: node_keys.clone(),
+        validator_wallet: validator_wallet.clone(),
+        depool_keys: depool_keys.clone(),
         depool_address: depool_address.to_string(),
         min_stake,
         validator_assurance,
@@ -320,11 +375,6 @@ async fn init_new(
     };
 
     write_json(config_path, &config)?;
-    if let Some(keys) = generated_node_keys {
-        keys.write(&config.node_keys_path)?;
-    }
-    validator_wallet.write(&config.validator_wallet_path)?;
-    depool_keys.write(&config.depool_keys_path)?;
 
     let chain_config = ChainConfig::fetch(&transport).await?;
     let network_min = chain_config
@@ -533,14 +583,11 @@ struct Loaded {
 
 impl Loaded {
     fn load(config_path: &Path) -> Result<Self> {
-        let data = fs::read_to_string(config_path)
-            .with_context(|| format!("failed to read config {}", config_path.display()))?;
-        let config: AppConfig = serde_json::from_str(&data)
-            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        let config = load_config(config_path)?;
         let transport = Transport::jrpc(&config.endpoint)?;
-        let node_keys = KeyFile::load(&config.node_keys_path)?.keypair()?;
-        let wallet_keys = KeyFile::load(&config.validator_wallet_path)?.keypair()?;
-        let depool_keys = KeyFile::load(&config.depool_keys_path)?.keypair()?;
+        let node_keys = config.node_keys.keypair()?;
+        let wallet_keys = config.validator_wallet.keypair()?;
+        let depool_keys = config.depool_keys.keypair()?;
         Ok(Self {
             config,
             transport,
@@ -1173,7 +1220,17 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let data = serde_json::to_string_pretty(value)?;
-    fs::write(path, data).with_context(|| format!("failed to write {}", path.display()))
+    fs::write(path, data).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn expand_home(path: &Path) -> PathBuf {

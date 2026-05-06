@@ -31,10 +31,11 @@ The installer creates:
 ```text
 ~/.cargo/bin/depool-elect
 ~/.tycho/depool-elect-config.json
-~/.tycho/depool-elect-validator-wallet.json
-~/.tycho/depool-elect-depool.json
 ~/.config/systemd/user/depool-elect.service
 ```
+
+All DePool app state is stored in `~/.tycho/depool-elect-config.json`,
+including copied node keys, the validator wallet keys, and the DePool keys.
 
 ## Fund
 
@@ -80,4 +81,6 @@ systemctl --user enable depool-elect
   the next election cycle.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
   proxy top-ups, ticktocks, and participation messages.
-- Re-running `./install.sh` does not overwrite an existing config or key files.
+- Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
+- Re-running `./install.sh` does not overwrite an existing config. If it finds an
+  older split-file config, it rewrites it into the single config file format.

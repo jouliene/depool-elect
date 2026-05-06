@@ -19,7 +19,7 @@ echo "installed binary: $BIN_DIR/depool-elect"
 
 if [[ -f "$CONFIG_PATH" ]]; then
     echo "config already exists: $CONFIG_PATH"
-    echo "leaving existing config and keys unchanged"
+    "$BIN_DIR/depool-elect" migrate-config --config "$CONFIG_PATH"
 else
     if [[ ! -f "$NODE_KEYS_PATH" ]]; then
         echo "missing node keys: $NODE_KEYS_PATH" >&2
