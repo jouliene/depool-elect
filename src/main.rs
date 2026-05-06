@@ -34,6 +34,7 @@ const UPDATE_ATTEMPTS: usize = 4;
 const TICKTOCK_INTERVAL_SECS: u64 = 60;
 const CONFIRMATION_ATTEMPTS: usize = 20;
 const CONFIRMATION_INTERVAL_SECS: u64 = 3;
+const DEFAULT_LOOP_SLEEP_SECS: u64 = 60;
 const ROUND_STEP_POOLING: u8 = 1;
 const ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 const COMPLETION_REASON_FAKE_ROUND: u8 = 2;
@@ -63,13 +64,18 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Status => status(&cli.config_path).await,
-        Command::Once => run_once(&cli.config_path).await,
+        Command::Once => run_once(&cli.config_path).await.map(|_| ()),
         Command::MigrateConfig => migrate_config(&cli.config_path),
         Command::Loop => loop {
-            if let Err(e) = run_once(&cli.config_path).await {
-                log(format!("ERROR: {e:#}"));
-            }
-            sleep(Duration::from_secs(60)).await;
+            let sleep_secs = match run_once(&cli.config_path).await {
+                Ok(sleep_secs) => sleep_secs,
+                Err(e) => {
+                    log(format!("ERROR: {e:#}"));
+                    DEFAULT_LOOP_SLEEP_SECS
+                }
+            };
+            log(format!("sleeping seconds={sleep_secs}"));
+            sleep(Duration::from_secs(sleep_secs)).await;
         },
     }
 }
@@ -224,6 +230,8 @@ struct AppConfig {
     ticktock_value: String,
     wallet_reserve: String,
     retry: usize,
+    #[serde(default)]
+    skipped_election_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,6 +276,7 @@ impl LegacyAppConfig {
             ticktock_value: self.ticktock_value,
             wallet_reserve: self.wallet_reserve,
             retry: self.retry,
+            skipped_election_id: None,
         })
     }
 }
@@ -372,6 +381,7 @@ async fn init_new(
         ticktock_value: DEFAULT_TICKTOCK_VALUE.to_owned(),
         wallet_reserve: DEFAULT_WALLET_RESERVE.to_owned(),
         retry: 5,
+        skipped_election_id: None,
     };
 
     write_json(config_path, &config)?;
@@ -476,8 +486,8 @@ async fn status(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_once(config_path: &Path) -> Result<()> {
-    let loaded = Loaded::load(config_path)?;
+async fn run_once(config_path: &Path) -> Result<u64> {
+    let mut loaded = Loaded::load(config_path)?;
     let mut wallet = loaded.wallet()?;
     let mut depool = loaded.depool()?;
     let chain_config = ChainConfig::fetch(&loaded.transport).await?;
@@ -506,11 +516,14 @@ async fn run_once(config_path: &Path) -> Result<()> {
         None => log("current_election=none"),
     }
 
+    let was_depool_active = depool.is_active();
     if !ensure_depool_deployed(&loaded, &mut wallet, &mut depool).await? {
-        return Ok(());
+        return Ok(DEFAULT_LOOP_SLEEP_SECS);
     }
+    let deployed_during_current_election = !was_depool_active && current_election.is_some();
+
     if !maintain_depool_balances(&loaded, &mut wallet, &mut depool).await? {
-        return Ok(());
+        return Ok(DEFAULT_LOOP_SLEEP_SECS);
     }
 
     depool.update().await?;
@@ -532,15 +545,35 @@ async fn run_once(config_path: &Path) -> Result<()> {
     if !ensure_pooling_validator_assurance(&loaded, &mut wallet, &mut depool, required_stake)
         .await?
     {
-        return Ok(());
+        return Ok(DEFAULT_LOOP_SLEEP_SECS);
     }
 
     let Some(current) = elector.get_data().await?.current_election().cloned() else {
         log("elections are not open; DePool is funded and pooling stake is ready");
-        return Ok(());
+        return Ok(DEFAULT_LOOP_SLEEP_SECS);
     };
 
-    let Some(ready) = advance_depool_for_election(
+    if deployed_during_current_election {
+        loaded.config.skipped_election_id = Some(current.elect_at);
+        write_json(config_path, &loaded.config)?;
+        let sleep_secs = seconds_until_timestamp(current.elect_close)?;
+        log(format!(
+            "depool was deployed after current elections opened; marked election skipped election_id={} until_elections_end={sleep_secs}",
+            current.elect_at
+        ));
+        return Ok(sleep_secs);
+    }
+
+    if loaded.config.skipped_election_id == Some(current.elect_at) {
+        let sleep_secs = seconds_until_timestamp(current.elect_close)?;
+        log(format!(
+            "current election already skipped election_id={} until_elections_end={sleep_secs}",
+            current.elect_at
+        ));
+        return Ok(sleep_secs);
+    }
+
+    let ready = match advance_depool_for_election(
         &loaded,
         &mut wallet,
         &mut depool,
@@ -548,8 +581,19 @@ async fn run_once(config_path: &Path) -> Result<()> {
         required_stake,
     )
     .await?
-    else {
-        return Ok(());
+    {
+        AdvanceResult::Ready(ready) => ready,
+        AdvanceResult::SkippedCurrentElection => {
+            loaded.config.skipped_election_id = Some(current.elect_at);
+            write_json(config_path, &loaded.config)?;
+            let sleep_secs = seconds_until_timestamp(current.elect_close)?;
+            log(format!(
+                "marked current election skipped election_id={} until_elections_end={sleep_secs}",
+                current.elect_at
+            ));
+            return Ok(sleep_secs);
+        }
+        AdvanceResult::NotReady => return Ok(DEFAULT_LOOP_SLEEP_SECS),
     };
 
     if ready.step != ROUND_STEP_WAITING_VALIDATOR_REQUEST {
@@ -557,7 +601,7 @@ async fn run_once(config_path: &Path) -> Result<()> {
             "depool target round is not WaitingValidatorRequest: {}",
             format_ready_round(&ready)
         ));
-        return Ok(());
+        return Ok(DEFAULT_LOOP_SLEEP_SECS);
     }
 
     participate(
@@ -571,7 +615,7 @@ async fn run_once(config_path: &Path) -> Result<()> {
     .await?;
 
     ensure_pooling_validator_assurance(&loaded, &mut wallet, &mut depool, required_stake).await?;
-    Ok(())
+    seconds_until_timestamp(current.elect_close)
 }
 
 struct Loaded {
@@ -760,6 +804,13 @@ struct ReadyRound {
     validator_stake: u64,
 }
 
+#[derive(Debug, Clone)]
+enum AdvanceResult {
+    Ready(ReadyRound),
+    SkippedCurrentElection,
+    NotReady,
+}
+
 async fn ensure_pooling_validator_assurance(
     loaded: &Loaded,
     wallet: &mut EverWallet,
@@ -820,7 +871,7 @@ async fn advance_depool_for_election(
     depool: &mut DePool,
     election_id: u32,
     required_stake: u128,
-) -> Result<Option<ReadyRound>> {
+) -> Result<AdvanceResult> {
     let mut sent_ticktock = false;
 
     for attempt in 1..=UPDATE_ATTEMPTS {
@@ -858,14 +909,14 @@ async fn advance_depool_for_election(
         log(format!("pooling_round {pooling_round_log}"));
 
         if target_round.supposed_elected_at == election_id {
-            return Ok(Some(target_round));
+            return Ok(AdvanceResult::Ready(target_round));
         }
 
         if sent_ticktock && target_completion_reason == COMPLETION_REASON_FAKE_ROUND {
             log(format!(
                 "depool target round is fake after ticktock; this usually means DePool was deployed after current elections opened and will rotate for the next election target_round={target_round_log}"
             ));
-            return Ok(None);
+            return Ok(AdvanceResult::SkippedCurrentElection);
         }
 
         if attempt == UPDATE_ATTEMPTS {
@@ -873,7 +924,7 @@ async fn advance_depool_for_election(
                 "target round did not reach current election after ticktock; target_round={}",
                 target_round_log
             ));
-            return Ok(None);
+            return Ok(AdvanceResult::NotReady);
         }
 
         let ticktock_value = parse_tokens_to_nano(&loaded.config.ticktock_value)?;
@@ -888,7 +939,7 @@ async fn advance_depool_for_election(
                 ticktock_value.saturating_add(wallet_reserve(&loaded.config)?),
                 "ticktock",
             );
-            return Ok(None);
+            return Ok(AdvanceResult::NotReady);
         }
         log(format!(
             "sending ticktock value={ticktock_value} attempt={attempt}"
@@ -1253,6 +1304,18 @@ fn now_millis() -> Result<u64> {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX))
+}
+
+fn now_secs() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before UNIX epoch")?
+        .as_secs())
+}
+
+fn seconds_until_timestamp(timestamp: u32) -> Result<u64> {
+    let seconds = u64::from(timestamp).saturating_sub(now_secs()?);
+    Ok(seconds.max(DEFAULT_LOOP_SLEEP_SECS))
 }
 
 fn log(message: impl AsRef<str>) {

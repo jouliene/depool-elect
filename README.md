@@ -135,8 +135,9 @@ systemctl --user restart depool-elect
 ## Notes
 
 - If the DePool is deployed or first staked after elections are already open, the
-  current election is skipped by DePool contract rules. The app will prepare for
-  the next election cycle.
+  current election is skipped by DePool contract rules. The app records that
+  election id in the config, stops ticktocking it, and sleeps until the election
+  closes.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
   proxy top-ups, ticktocks, and participation messages.
 - Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
