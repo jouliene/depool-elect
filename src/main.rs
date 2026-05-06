@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use minik2::{
-    Config as ChainConfig, DePool, DePoolParticipant, DePoolRound, Elector, EverWallet, KeyPair,
-    SendReceipt, Transport, build_elections_data_to_sign, build_participate_in_elections_payload,
-    build_ticktock_payload,
+    Config as ChainConfig, DePool, DePoolParticipant, DePoolRound, ElectionTimeline, Elector,
+    EverWallet, KeyPair, SendReceipt, Transport, build_elections_data_to_sign,
+    build_participate_in_elections_payload, build_ticktock_payload,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -35,6 +35,7 @@ const TICKTOCK_INTERVAL_SECS: u64 = 60;
 const CONFIRMATION_ATTEMPTS: usize = 20;
 const CONFIRMATION_INTERVAL_SECS: u64 = 3;
 const DEFAULT_LOOP_SLEEP_SECS: u64 = 60;
+const WAKE_BEFORE_ELECTIONS_SECS: u32 = 300;
 const ROUND_STEP_POOLING: u8 = 1;
 const ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 const COMPLETION_REASON_FAKE_ROUND: u8 = 2;
@@ -549,8 +550,9 @@ async fn run_once(config_path: &Path) -> Result<u64> {
     }
 
     let Some(current) = elector.get_data().await?.current_election().cloned() else {
+        let sleep_secs = sleep_for_closed_elections(&chain_config)?;
         log("elections are not open; DePool is funded and pooling stake is ready");
-        return Ok(DEFAULT_LOOP_SLEEP_SECS);
+        return Ok(sleep_secs);
     };
 
     if deployed_during_current_election {
@@ -1143,6 +1145,40 @@ fn current_pooling_stake(depool: &DePool, participant: &minik2::StdAddr) -> Resu
         depool.get_participant_info(participant)?,
         pooling_round.id,
     )))
+}
+
+fn sleep_for_closed_elections(chain_config: &ChainConfig) -> Result<u64> {
+    let sleep_secs = match chain_config.elections_timeline()? {
+        ElectionTimeline::AfterElections { until_round_end } => {
+            let sleep_secs = u64::from(until_round_end).max(DEFAULT_LOOP_SLEEP_SECS);
+            log(format!(
+                "waiting for validation round end until_round_end={until_round_end}"
+            ));
+            sleep_secs
+        }
+        ElectionTimeline::BeforeElections {
+            until_elections_start,
+        } => {
+            let sleep_secs =
+                u64::from(until_elections_start.saturating_sub(WAKE_BEFORE_ELECTIONS_SECS))
+                    .max(DEFAULT_LOOP_SLEEP_SECS);
+            log(format!(
+                "waiting for next elections until_elections_start={until_elections_start} wake_before={WAKE_BEFORE_ELECTIONS_SECS}"
+            ));
+            sleep_secs
+        }
+        ElectionTimeline::Elections {
+            until_elections_end,
+            elections_end,
+            ..
+        } => {
+            log(format!(
+                "chain timeline is in elections but elector has no current election until_elections_end={until_elections_end} elections_end={elections_end}"
+            ));
+            DEFAULT_LOOP_SLEEP_SECS
+        }
+    };
+    Ok(sleep_secs)
 }
 
 async fn wait_for_pooling_stake_at_least(

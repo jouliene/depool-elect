@@ -138,6 +138,8 @@ systemctl --user restart depool-elect
   current election is skipped by DePool contract rules. The app records that
   election id in the config, stops ticktocking it, and sleeps until the election
   closes.
+- When elections are closed, the service sleeps until the next chain timeline
+  boundary instead of polling RPC every minute.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
   proxy top-ups, ticktocks, and participation messages.
 - Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
