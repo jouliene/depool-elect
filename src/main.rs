@@ -383,6 +383,7 @@ async fn init_new(
         .into_inner();
     let target = target_depool_stake(&config, None, network_min)?;
     let suggested_topup = target
+        .saturating_mul(2)
         .saturating_add(minik2::MIN_BALANCE_FOR_DEPLOY)
         .saturating_add(DEPOOL_TARGET_BALANCE)
         .saturating_add(parse_tokens_to_nano(&config.participate_value)?)
@@ -397,7 +398,7 @@ async fn init_new(
     log(format!("network_min_stake={}", format_tokens(network_min)));
     log(format!("target_depool_stake={}", format_tokens(target)));
     log(format!(
-        "TOPUP validator_wallet={} with about {} TYCHO before `depool-elect once`",
+        "TOPUP validator_wallet={} with about {} TYCHO before `depool-elect once` (covers two validator-assurance rounds)",
         wallet.address(),
         format_tokens(suggested_topup)
     ));

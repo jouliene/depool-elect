@@ -70,7 +70,7 @@ Example output:
 ```text
 INFO: validator_wallet=0:abc...
 INFO: depool_address=0:def...
-INFO: TOPUP validator_wallet=0:abc... with about 10182 TYCHO before `depool-elect once`
+INFO: TOPUP validator_wallet=0:abc... with about 20182 TYCHO before `depool-elect once` (covers two validator-assurance rounds)
 ```
 
 Send the suggested amount to `validator_wallet`.
