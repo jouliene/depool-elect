@@ -807,6 +807,51 @@ struct ReadyRound {
 }
 
 #[derive(Debug, Clone)]
+struct AssuranceStake {
+    previous_round_id: Option<u64>,
+    pooling_round_id: u64,
+    previous_round_stake: u128,
+    pooling_round_stake: u128,
+}
+
+impl AssuranceStake {
+    fn total(&self) -> u128 {
+        self.previous_round_stake
+            .saturating_add(self.pooling_round_stake)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DePoolUpdateState {
+    previous: RoundUpdateState,
+    target: RoundUpdateState,
+    pooling: RoundUpdateState,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RoundUpdateState {
+    id: u64,
+    supposed_elected_at: u32,
+    step: u8,
+    stake: u64,
+    validator_stake: u64,
+    completion_reason: u8,
+}
+
+impl RoundUpdateState {
+    fn from_round(round: &DePoolRound) -> Self {
+        Self {
+            id: round.id,
+            supposed_elected_at: round.supposed_elected_at,
+            step: round.step,
+            stake: round.stake,
+            validator_stake: round.validator_stake,
+            completion_reason: round.completion_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum AdvanceResult {
     Ready(ReadyRound),
     SkippedCurrentElection,
@@ -820,22 +865,21 @@ async fn ensure_pooling_validator_assurance(
     required_stake: u128,
 ) -> Result<bool> {
     depool.update().await?;
-    let Some(pooling_round) = depool
-        .get_rounds()
-        .iter()
-        .find(|round| round.step == ROUND_STEP_POOLING)
-        .cloned()
-    else {
+    let Some(assurance) = assurance_stake(depool, wallet.address())? else {
         log("DePool has no pooling round; waiting for round rotation");
         return Ok(false);
     };
 
-    let participant = depool.get_participant_info(wallet.address())?;
-    let current_stake = participant_round_stake(participant, pooling_round.id);
+    let current_stake = assurance.total();
     if current_stake >= required_stake {
         log(format!(
-            "pooling_validator_stake_ready round_id={} current={} required={}",
-            pooling_round.id, current_stake, required_stake
+            "pooling_validator_stake_ready pooling_round_id={} previous_round_id={} current={} pooling={} previous={} required={}",
+            assurance.pooling_round_id,
+            format_optional_round_id(assurance.previous_round_id),
+            current_stake,
+            assurance.pooling_round_stake,
+            assurance.previous_round_stake,
+            required_stake
         ));
         return Ok(true);
     }
@@ -858,12 +902,18 @@ async fn ensure_pooling_validator_assurance(
     }
 
     log(format!(
-        "adding validator assurance to pooling round_id={} current={} add={} required={}",
-        pooling_round.id, current_stake, stake_to_add, required_stake
+        "adding validator assurance to pooling round_id={} previous_round_id={} current={} pooling={} previous={} add={} required={}",
+        assurance.pooling_round_id,
+        format_optional_round_id(assurance.previous_round_id),
+        current_stake,
+        assurance.pooling_round_stake,
+        assurance.previous_round_stake,
+        stake_to_add,
+        required_stake
     ));
     let receipt = depool.add_ordinary_stake(wallet, stake_to_add).await?;
     log_receipt("add_ordinary_stake", &receipt);
-    wait_for_pooling_stake_at_least(depool, wallet.address(), required_stake).await?;
+    wait_for_assurance_stake_at_least(depool, wallet.address(), required_stake).await?;
     Ok(true)
 }
 
@@ -875,6 +925,7 @@ async fn advance_depool_for_election(
     required_stake: u128,
 ) -> Result<AdvanceResult> {
     let mut sent_ticktock = false;
+    let mut state_before_ticktock = None;
 
     for attempt in 1..=UPDATE_ATTEMPTS {
         depool.update().await?;
@@ -899,6 +950,11 @@ async fn advance_depool_for_election(
         let prev_round_log = format_round(&rounds[0]);
         let target_round_log = format_round(&rounds[1]);
         let pooling_round_log = format_round(&rounds[2]);
+        let update_state = DePoolUpdateState {
+            previous: RoundUpdateState::from_round(&rounds[0]),
+            target: RoundUpdateState::from_round(&rounds[1]),
+            pooling: RoundUpdateState::from_round(&rounds[2]),
+        };
         let participant = depool.get_participant_info(wallet.address())?;
         let pooling_stake = participant_round_stake(participant, pooling_round_id)
             + participant_round_stake(participant, prev_round_id);
@@ -917,6 +973,13 @@ async fn advance_depool_for_election(
         if sent_ticktock && target_completion_reason == COMPLETION_REASON_FAKE_ROUND {
             log(format!(
                 "depool target round is fake after ticktock; this usually means DePool was deployed after current elections opened and will rotate for the next election target_round={target_round_log}"
+            ));
+            return Ok(AdvanceResult::SkippedCurrentElection);
+        }
+
+        if sent_ticktock && state_before_ticktock.as_ref() == Some(&update_state) {
+            log(format!(
+                "depool rounds did not advance after ticktock; current election cannot be reached without later contract state changes target_round={target_round_log}"
             ));
             return Ok(AdvanceResult::SkippedCurrentElection);
         }
@@ -946,6 +1009,7 @@ async fn advance_depool_for_election(
         log(format!(
             "sending ticktock value={ticktock_value} attempt={attempt}"
         ));
+        state_before_ticktock = Some(update_state);
         let receipt = send_depool_ticktock(loaded, wallet, depool, ticktock_value).await?;
         log_receipt("ticktock", &receipt);
         sent_ticktock = true;
@@ -1137,14 +1201,31 @@ fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u6
         .unwrap_or_default()
 }
 
-fn current_pooling_stake(depool: &DePool, participant: &minik2::StdAddr) -> Result<Option<u128>> {
-    let Some(pooling_round) = depool.get_rounds().iter().find(|round| round.step == 1) else {
+fn assurance_stake(
+    depool: &DePool,
+    participant_address: &minik2::StdAddr,
+) -> Result<Option<AssuranceStake>> {
+    let rounds = depool.get_rounds();
+    let Some(pooling_round) = rounds.iter().find(|round| round.step == ROUND_STEP_POOLING) else {
         return Ok(None);
     };
-    Ok(Some(participant_round_stake(
-        depool.get_participant_info(participant)?,
-        pooling_round.id,
-    )))
+
+    let previous_round_id = rounds
+        .first()
+        .map(|round| round.id)
+        .filter(|&id| id != pooling_round.id);
+    let participant = depool.get_participant_info(participant_address)?;
+    let previous_round_stake = previous_round_id
+        .map(|round_id| participant_round_stake(participant, round_id))
+        .unwrap_or_default();
+    let pooling_round_stake = participant_round_stake(participant, pooling_round.id);
+
+    Ok(Some(AssuranceStake {
+        previous_round_id,
+        pooling_round_id: pooling_round.id,
+        previous_round_stake,
+        pooling_round_stake,
+    }))
 }
 
 fn sleep_for_closed_elections(chain_config: &ChainConfig) -> Result<u64> {
@@ -1181,7 +1262,7 @@ fn sleep_for_closed_elections(chain_config: &ChainConfig) -> Result<u64> {
     Ok(sleep_secs)
 }
 
-async fn wait_for_pooling_stake_at_least(
+async fn wait_for_assurance_stake_at_least(
     depool: &mut DePool,
     participant: &minik2::StdAddr,
     threshold: u128,
@@ -1191,16 +1272,28 @@ async fn wait_for_pooling_stake_at_least(
             sleep(Duration::from_secs(CONFIRMATION_INTERVAL_SECS)).await;
         }
         depool.update().await?;
-        let stake = current_pooling_stake(depool, participant)?.unwrap_or_default();
+        let assurance = assurance_stake(depool, participant)?;
+        let stake = assurance
+            .as_ref()
+            .map(AssuranceStake::total)
+            .unwrap_or_default();
+        let pooling = assurance
+            .as_ref()
+            .map(|assurance| assurance.pooling_round_stake)
+            .unwrap_or_default();
+        let previous = assurance
+            .as_ref()
+            .map(|assurance| assurance.previous_round_stake)
+            .unwrap_or_default();
         log(format!(
-            "stake_confirm attempt={attempt} pooling_stake={stake}"
+            "stake_confirm attempt={attempt} assurance_stake={stake} pooling_stake={pooling} previous_round_stake={previous}"
         ));
         if stake >= threshold {
             return Ok(());
         }
     }
 
-    bail!("pooling stake did not reach {threshold}");
+    bail!("validator assurance stake did not reach {threshold}");
 }
 
 async fn wallet_has(wallet: &mut EverWallet, required: u128) -> Result<bool> {
@@ -1248,6 +1341,12 @@ fn format_round(round: &DePoolRound) -> String {
         round.validator_stake,
         round.completion_reason
     )
+}
+
+fn format_optional_round_id(round_id: Option<u64>) -> String {
+    round_id
+        .map(|round_id| round_id.to_string())
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 fn format_addresses(addresses: &[minik2::StdAddr]) -> String {

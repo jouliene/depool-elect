@@ -138,6 +138,9 @@ systemctl --user restart depool-elect
   current election is skipped by DePool contract rules. The app records that
   election id in the config, stops ticktocking it, and sleeps until the election
   closes.
+- For an existing DePool, validator assurance top-up counts stake in the oldest
+  DePool round plus the current pooling round, because the oldest round is the
+  one expected to reinvest into pooling before the next usable election round.
 - When elections are closed, the service sleeps until the next chain timeline
   boundary instead of polling RPC every minute.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
