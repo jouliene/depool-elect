@@ -23,11 +23,10 @@ curl https://sh.rustup.rs -sSf | sh -s -- -y
 . "$HOME/.cargo/env"
 ```
 
-Create a code folder and clone the app:
+Clone the app:
 
 ```bash
-mkdir -p ~/RUST_CODE
-cd ~/RUST_CODE
+cd ~
 git clone https://github.com/jouliene/depool-elect.git
 cd depool-elect
 ```
@@ -127,7 +126,7 @@ systemctl --user stop depool-elect
 Pull new code, reinstall the binary, and restart the service:
 
 ```bash
-cd ~/RUST_CODE/depool-elect
+cd ~/depool-elect
 git pull
 ./install.sh
 systemctl --user restart depool-elect
