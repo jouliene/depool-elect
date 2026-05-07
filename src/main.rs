@@ -27,7 +27,6 @@ const DEFAULT_WALLET_RESERVE: &str = "10";
 const DEFAULT_STAKE_FACTOR: u32 = 3 * 65_536;
 const DEPOOL_MIN_BALANCE: u128 = 20 * ONE;
 const DEPOOL_TARGET_BALANCE: u128 = 30 * ONE;
-const DEPOOL_BALANCE_THRESHOLD_MARGIN: u128 = 5 * ONE;
 const PROXY_MIN_BALANCE: u128 = 3 * ONE;
 const PROXY_TARGET_BALANCE: u128 = 5 * ONE;
 const ADD_STAKE_GAS: u128 = 500_000_000;
@@ -39,6 +38,7 @@ const DEFAULT_LOOP_SLEEP_SECS: u64 = 60;
 const WAKE_BEFORE_ELECTIONS_SECS: u32 = 300;
 const ROUND_STEP_POOLING: u8 = 1;
 const ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
+const ROUND_STEP_WAITING_IF_STAKE_ACCEPTED: u8 = 3;
 const COMPLETION_REASON_FAKE_ROUND: u8 = 2;
 
 #[tokio::main]
@@ -527,8 +527,8 @@ async fn run_once(config_path: &Path) -> Result<u64> {
     let deployed_during_current_election = !was_depool_active && current_election.is_some();
     let depool_balance_was_below_required = depool_balance_topup(
         depool.own_balance,
-        depool_min_own_balance(&depool),
-        depool_target_own_balance(&depool),
+        DEPOOL_MIN_BALANCE,
+        DEPOOL_TARGET_BALANCE,
     )?
     .is_some();
 
@@ -751,9 +751,11 @@ async fn maintain_depool_balances(
     depool: &mut DePool,
 ) -> Result<bool> {
     depool.update().await?;
-    let min_balance = depool_min_own_balance(depool);
-    let target_balance = depool_target_own_balance(depool);
-    if let Some(topup) = depool_balance_topup(depool.own_balance, min_balance, target_balance)? {
+    if let Some(topup) = depool_balance_topup(
+        depool.own_balance,
+        DEPOOL_MIN_BALANCE,
+        DEPOOL_TARGET_BALANCE,
+    )? {
         if wallet_has(
             wallet,
             topup.saturating_add(wallet_reserve(&loaded.config)?),
@@ -761,9 +763,19 @@ async fn maintain_depool_balances(
         .await?
         {
             log(format!(
-                "depool balance topup value={topup} own_balance={} threshold={} target={target_balance}",
-                depool.own_balance, depool.balance_threshold
+                "depool balance topup value={topup} own_balance={} threshold={} min={} target={}",
+                depool.own_balance,
+                depool.balance_threshold,
+                DEPOOL_MIN_BALANCE,
+                DEPOOL_TARGET_BALANCE
             ));
+            if depool.own_balance >= DEPOOL_MIN_BALANCE as i128
+                && depool.own_balance < depool.balance_threshold as i128
+            {
+                log(
+                    "depool own balance is below balance_threshold, but ticktock/participate are gated by the lower DePool critical threshold",
+                );
+            }
             let receipt = depool.receive_funds(wallet, topup).await?;
             log_receipt("depool_balance_topup", &receipt);
             depool.update().await?;
@@ -777,8 +789,8 @@ async fn maintain_depool_balances(
         }
     } else {
         log(format!(
-            "depool_balance_ready own_balance={} threshold={} min={} target={target_balance}",
-            depool.own_balance, depool.balance_threshold, min_balance
+            "depool_balance_ready own_balance={} threshold={} min={} target={}",
+            depool.own_balance, depool.balance_threshold, DEPOOL_MIN_BALANCE, DEPOOL_TARGET_BALANCE
         ));
     }
 
@@ -992,6 +1004,14 @@ async fn advance_depool_for_election(
         log(format!("target_round {target_round_log}"));
         log(format!("pooling_round {pooling_round_log}"));
 
+        if let Some(round) = waiting_acceptance_blocker(rounds, election_id) {
+            log(format!(
+                "depool queue is blocked by stale WaitingIfStakeAccepted round; ticktock cannot rotate until elector/proxy callback changes it blocker_round={} election_id={election_id}",
+                format_round(round)
+            ));
+            return Ok(AdvanceResult::NotReady);
+        }
+
         if target_round.supposed_elected_at == election_id {
             return Ok(AdvanceResult::Ready(target_round));
         }
@@ -1006,14 +1026,14 @@ async fn advance_depool_for_election(
         if sent_ticktock && state_before_ticktock.as_ref() == Some(&update_state) {
             if depool_balance_topup(
                 depool.own_balance,
-                depool_min_own_balance(depool),
-                depool_target_own_balance(depool),
+                DEPOOL_MIN_BALANCE,
+                DEPOOL_TARGET_BALANCE,
             )?
             .is_some()
             {
                 log(format!(
-                    "depool rounds did not advance after ticktock and own balance is below threshold; will retry after balance topup own_balance={} threshold={} target_round={target_round_log}",
-                    depool.own_balance, depool.balance_threshold
+                    "depool rounds did not advance after ticktock and own balance is below app minimum; will retry after balance topup own_balance={} min={} target_round={target_round_log}",
+                    depool.own_balance, DEPOOL_MIN_BALANCE
                 ));
                 return Ok(AdvanceResult::NotReady);
             }
@@ -1229,15 +1249,6 @@ fn target_depool_stake(
     Ok(configured.max(depool_required).max(network_min))
 }
 
-fn depool_min_own_balance(depool: &DePool) -> u128 {
-    DEPOOL_MIN_BALANCE.max(depool.balance_threshold as u128)
-}
-
-fn depool_target_own_balance(depool: &DePool) -> u128 {
-    DEPOOL_TARGET_BALANCE
-        .max(depool_min_own_balance(depool).saturating_add(DEPOOL_BALANCE_THRESHOLD_MARGIN))
-}
-
 fn depool_balance_topup(
     own_balance: i128,
     minimum_balance: u128,
@@ -1257,6 +1268,16 @@ fn depool_balance_topup(
             .try_into()
             .context("DePool own balance topup does not fit u128")?,
     ))
+}
+
+fn waiting_acceptance_blocker<'a>(
+    rounds: &'a [DePoolRound],
+    election_id: u32,
+) -> Option<&'a DePoolRound> {
+    rounds.iter().take(2).find(|round| {
+        round.step == ROUND_STEP_WAITING_IF_STAKE_ACCEPTED
+            && round.supposed_elected_at != election_id
+    })
 }
 
 fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u64) -> u128 {
@@ -1535,18 +1556,35 @@ fn log_receipt(label: &str, receipt: &SendReceipt) {
 mod tests {
     use super::*;
 
+    fn round(id: u64, step: u8, supposed_elected_at: u32) -> DePoolRound {
+        DePoolRound {
+            id,
+            supposed_elected_at,
+            unfreeze: 0,
+            stake_held_for: 0,
+            vset_hash_in_election_phase: 0,
+            step,
+            completion_reason: 0,
+            stake: 0,
+            recovered_stake: 0,
+            unused: 0,
+            is_validator_stake_completed: false,
+            participant_reward: 0,
+            participant_qty: 0,
+            validator_stake: 0,
+            validator_remaining_stake: 0,
+            handled_stakes_and_rewards: 0,
+        }
+    }
+
     #[test]
-    fn tops_up_when_own_balance_is_above_static_min_but_below_contract_threshold() {
+    fn does_not_top_up_above_static_min_even_if_below_contract_balance_threshold() {
         let own_balance = 23_645_705_112;
-        let contract_threshold = 25_356_342_999;
-        let target =
-            DEPOOL_TARGET_BALANCE.max(contract_threshold + DEPOOL_BALANCE_THRESHOLD_MARGIN);
 
-        let topup = depool_balance_topup(own_balance, contract_threshold, target)
-            .expect("topup calculation")
-            .expect("topup should be required");
+        let topup = depool_balance_topup(own_balance, DEPOOL_MIN_BALANCE, DEPOOL_TARGET_BALANCE)
+            .expect("topup calculation");
 
-        assert_eq!(topup, 6_710_637_887);
+        assert_eq!(topup, None);
     }
 
     #[test]
@@ -1561,12 +1599,39 @@ mod tests {
 
     #[test]
     fn does_not_top_up_when_own_balance_reaches_minimum() {
-        let threshold = 25_356_342_999;
-        let target = threshold + DEPOOL_BALANCE_THRESHOLD_MARGIN;
-
-        let topup =
-            depool_balance_topup(threshold as i128, threshold, target).expect("topup calculation");
+        let topup = depool_balance_topup(
+            DEPOOL_MIN_BALANCE as i128,
+            DEPOOL_MIN_BALANCE,
+            DEPOOL_TARGET_BALANCE,
+        )
+        .expect("topup calculation");
 
         assert_eq!(topup, None);
+    }
+
+    #[test]
+    fn detects_stale_waiting_acceptance_round_that_blocks_rotation() {
+        let current_election = 1_778_158_305;
+        let rounds = vec![
+            round(2, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, 1_777_634_017),
+            round(3, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, 1_777_699_553),
+            round(4, ROUND_STEP_POOLING, 0),
+        ];
+
+        let blocker = waiting_acceptance_blocker(&rounds, current_election)
+            .expect("stale waiting acceptance round should block rotation");
+
+        assert_eq!(blocker.id, 2);
+    }
+
+    #[test]
+    fn ignores_waiting_acceptance_for_current_election() {
+        let current_election = 1_778_158_305;
+        let rounds = vec![
+            round(2, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, current_election),
+            round(3, ROUND_STEP_POOLING, 0),
+        ];
+
+        assert!(waiting_acceptance_blocker(&rounds, current_election).is_none());
     }
 }

@@ -145,8 +145,8 @@ systemctl --user restart depool-elect
   boundary instead of polling RPC every minute.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
   DePool/proxy top-ups, ticktocks, and participation messages. The app keeps
-  DePool own balance above the contract `balanceThreshold`, targeting at least
-  5 TYCHO above that threshold and never below 30 TYCHO.
+  DePool own balance above 20 TYCHO and tops it up to 30 TYCHO; DePool
+  `balanceThreshold` is logged for diagnostics but is not the ticktock gate.
 - Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
 - Re-running `./install.sh` does not overwrite an existing config. If it finds an
   older split-file config, it rewrites it into the single config file format.
