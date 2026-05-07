@@ -144,7 +144,9 @@ systemctl --user restart depool-elect
 - When elections are closed, the service sleeps until the next chain timeline
   boundary instead of polling RPC every minute.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
-  proxy top-ups, ticktocks, and participation messages.
+  DePool/proxy top-ups, ticktocks, and participation messages. The app keeps
+  DePool own balance above the contract `balanceThreshold`, targeting at least
+  5 TYCHO above that threshold and never below 30 TYCHO.
 - Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
 - Re-running `./install.sh` does not overwrite an existing config. If it finds an
   older split-file config, it rewrites it into the single config file format.

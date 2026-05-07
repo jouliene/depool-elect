@@ -27,6 +27,7 @@ const DEFAULT_WALLET_RESERVE: &str = "10";
 const DEFAULT_STAKE_FACTOR: u32 = 3 * 65_536;
 const DEPOOL_MIN_BALANCE: u128 = 20 * ONE;
 const DEPOOL_TARGET_BALANCE: u128 = 30 * ONE;
+const DEPOOL_BALANCE_THRESHOLD_MARGIN: u128 = 5 * ONE;
 const PROXY_MIN_BALANCE: u128 = 3 * ONE;
 const PROXY_TARGET_BALANCE: u128 = 5 * ONE;
 const ADD_STAKE_GAS: u128 = 500_000_000;
@@ -434,11 +435,12 @@ async fn status(config_path: &Path) -> Result<()> {
         wallet.balance()
     ));
     log(format!(
-        "depool={} active={} own_balance={} account_balance={}",
+        "depool={} active={} own_balance={} account_balance={} balance_threshold={}",
         depool.address,
         depool.is_active(),
         depool.own_balance,
-        depool.account_balance
+        depool.account_balance,
+        depool.balance_threshold
     ));
     log(format!(
         "depool_validator_wallet={}",
@@ -506,11 +508,12 @@ async fn run_once(config_path: &Path) -> Result<u64> {
         wallet.balance()
     ));
     log(format!(
-        "depool={} active={} own_balance={} account_balance={}",
+        "depool={} active={} own_balance={} account_balance={} balance_threshold={}",
         depool.address,
         depool.is_active(),
         depool.own_balance,
-        depool.account_balance
+        depool.account_balance,
+        depool.balance_threshold
     ));
     match current_election {
         Some(election_id) => log(format!("current_election={election_id}")),
@@ -522,6 +525,12 @@ async fn run_once(config_path: &Path) -> Result<u64> {
         return Ok(DEFAULT_LOOP_SLEEP_SECS);
     }
     let deployed_during_current_election = !was_depool_active && current_election.is_some();
+    let depool_balance_was_below_required = depool_balance_topup(
+        depool.own_balance,
+        depool_min_own_balance(&depool),
+        depool_target_own_balance(&depool),
+    )?
+    .is_some();
 
     if !maintain_depool_balances(&loaded, &mut wallet, &mut depool).await? {
         return Ok(DEFAULT_LOOP_SLEEP_SECS);
@@ -564,6 +573,17 @@ async fn run_once(config_path: &Path) -> Result<u64> {
             current.elect_at
         ));
         return Ok(sleep_secs);
+    }
+
+    if loaded.config.skipped_election_id == Some(current.elect_at)
+        && depool_balance_was_below_required
+    {
+        loaded.config.skipped_election_id = None;
+        write_json(config_path, &loaded.config)?;
+        log(format!(
+            "current election was previously skipped while DePool own balance was below threshold; retrying election_id={}",
+            current.elect_at
+        ));
     }
 
     if loaded.config.skipped_election_id == Some(current.elect_at) {
@@ -731,18 +751,19 @@ async fn maintain_depool_balances(
     depool: &mut DePool,
 ) -> Result<bool> {
     depool.update().await?;
-    if depool.own_balance < DEPOOL_MIN_BALANCE as i128 {
-        let topup: u128 = (DEPOOL_TARGET_BALANCE as i128 - depool.own_balance)
-            .max(0)
-            .try_into()
-            .context("depool topup does not fit u128")?;
+    let min_balance = depool_min_own_balance(depool);
+    let target_balance = depool_target_own_balance(depool);
+    if let Some(topup) = depool_balance_topup(depool.own_balance, min_balance, target_balance)? {
         if wallet_has(
             wallet,
             topup.saturating_add(wallet_reserve(&loaded.config)?),
         )
         .await?
         {
-            log(format!("depool balance topup value={topup}"));
+            log(format!(
+                "depool balance topup value={topup} own_balance={} threshold={} target={target_balance}",
+                depool.own_balance, depool.balance_threshold
+            ));
             let receipt = depool.receive_funds(wallet, topup).await?;
             log_receipt("depool_balance_topup", &receipt);
             depool.update().await?;
@@ -754,6 +775,11 @@ async fn maintain_depool_balances(
             );
             return Ok(false);
         }
+    } else {
+        log(format!(
+            "depool_balance_ready own_balance={} threshold={} min={} target={target_balance}",
+            depool.own_balance, depool.balance_threshold, min_balance
+        ));
     }
 
     for proxy in depool.proxies.clone() {
@@ -978,6 +1004,20 @@ async fn advance_depool_for_election(
         }
 
         if sent_ticktock && state_before_ticktock.as_ref() == Some(&update_state) {
+            if depool_balance_topup(
+                depool.own_balance,
+                depool_min_own_balance(depool),
+                depool_target_own_balance(depool),
+            )?
+            .is_some()
+            {
+                log(format!(
+                    "depool rounds did not advance after ticktock and own balance is below threshold; will retry after balance topup own_balance={} threshold={} target_round={target_round_log}",
+                    depool.own_balance, depool.balance_threshold
+                ));
+                return Ok(AdvanceResult::NotReady);
+            }
+
             log(format!(
                 "depool rounds did not advance after ticktock; current election cannot be reached without later contract state changes target_round={target_round_log}"
             ));
@@ -1187,6 +1227,36 @@ fn target_depool_stake(
                 .max(parse_tokens_to_nano(&config.min_stake).unwrap_or(0))
         });
     Ok(configured.max(depool_required).max(network_min))
+}
+
+fn depool_min_own_balance(depool: &DePool) -> u128 {
+    DEPOOL_MIN_BALANCE.max(depool.balance_threshold as u128)
+}
+
+fn depool_target_own_balance(depool: &DePool) -> u128 {
+    DEPOOL_TARGET_BALANCE
+        .max(depool_min_own_balance(depool).saturating_add(DEPOOL_BALANCE_THRESHOLD_MARGIN))
+}
+
+fn depool_balance_topup(
+    own_balance: i128,
+    minimum_balance: u128,
+    target_balance: u128,
+) -> Result<Option<u128>> {
+    let minimum_balance =
+        i128::try_from(minimum_balance).context("DePool minimum own balance does not fit i128")?;
+    if own_balance >= minimum_balance {
+        return Ok(None);
+    }
+
+    let target_balance =
+        i128::try_from(target_balance).context("DePool target own balance does not fit i128")?;
+    let topup = target_balance.saturating_sub(own_balance);
+    Ok(Some(
+        topup
+            .try_into()
+            .context("DePool own balance topup does not fit u128")?,
+    ))
 }
 
 fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u64) -> u128 {
@@ -1459,4 +1529,44 @@ fn log(message: impl AsRef<str>) {
 
 fn log_receipt(label: &str, receipt: &SendReceipt) {
     log(format!("{label}_hash={}", receipt.message_hash));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tops_up_when_own_balance_is_above_static_min_but_below_contract_threshold() {
+        let own_balance = 23_645_705_112;
+        let contract_threshold = 25_356_342_999;
+        let target =
+            DEPOOL_TARGET_BALANCE.max(contract_threshold + DEPOOL_BALANCE_THRESHOLD_MARGIN);
+
+        let topup = depool_balance_topup(own_balance, contract_threshold, target)
+            .expect("topup calculation")
+            .expect("topup should be required");
+
+        assert_eq!(topup, 6_710_637_887);
+    }
+
+    #[test]
+    fn uses_legacy_target_when_contract_threshold_is_lower() {
+        let own_balance = 19 * ONE as i128;
+        let topup = depool_balance_topup(own_balance, DEPOOL_MIN_BALANCE, DEPOOL_TARGET_BALANCE)
+            .expect("topup calculation")
+            .expect("topup should be required");
+
+        assert_eq!(topup, 11 * ONE);
+    }
+
+    #[test]
+    fn does_not_top_up_when_own_balance_reaches_minimum() {
+        let threshold = 25_356_342_999;
+        let target = threshold + DEPOOL_BALANCE_THRESHOLD_MARGIN;
+
+        let topup =
+            depool_balance_topup(threshold as i128, threshold, target).expect("topup calculation");
+
+        assert_eq!(topup, None);
+    }
 }
