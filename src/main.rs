@@ -1044,6 +1044,15 @@ async fn participate(
         ));
         return Ok(());
     }
+    if let Some((registered_validator_key, member)) =
+        election_member_by_source(&current, &proxy.address)
+    {
+        log(format!(
+            "proxy already registered proxy={} validator_key={} stake={}",
+            proxy, registered_validator_key, member.msg_value
+        ));
+        return Ok(());
+    }
 
     let data = build_elections_data_to_sign(
         election_id,
@@ -1106,10 +1115,29 @@ async fn participate(
             ));
             return Ok(());
         }
+        if let Some((registered_validator_key, member)) =
+            election_member_by_source(current, &proxy.address)
+        {
+            log(format!(
+                "confirmed election_id={} proxy={} validator_key={} stake={}",
+                current.elect_at, proxy, registered_validator_key, member.msg_value
+            ));
+            return Ok(());
+        }
         log(format!("confirmation attempt={attempt} not_registered"));
     }
 
     bail!("validator key not registered after confirmation timeout")
+}
+
+fn election_member_by_source<'a>(
+    current: &'a minik2::CurrentElectionData,
+    source: &minik2::HashBytes,
+) -> Option<(&'a minik2::HashBytes, &'a minik2::ElectionMember)> {
+    current
+        .members
+        .iter()
+        .find(|(_, member)| member.src_addr == *source)
 }
 
 async fn send_depool_ticktock(
@@ -1478,6 +1506,7 @@ fn log_receipt(label: &str, receipt: &SendReceipt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn does_not_top_up_above_static_min_even_if_below_contract_balance_threshold() {
@@ -1509,5 +1538,37 @@ mod tests {
         .expect("topup calculation");
 
         assert_eq!(topup, None);
+    }
+
+    #[test]
+    fn finds_election_member_by_proxy_source() {
+        let validator_key = minik2::HashBytes([1; 32]);
+        let proxy_source = minik2::HashBytes([2; 32]);
+        let mut members = BTreeMap::new();
+        members.insert(
+            validator_key,
+            minik2::ElectionMember {
+                msg_value: minik2::FpTokens(10 * ONE),
+                created_at: 123,
+                stake_factor: DEFAULT_STAKE_FACTOR,
+                src_addr: proxy_source,
+                adnl_addr: minik2::HashBytes([3; 32]),
+            },
+        );
+        let current = minik2::CurrentElectionData {
+            elect_at: 456,
+            elect_close: 789,
+            min_stake: minik2::FpTokens(0),
+            total_stake: minik2::FpTokens(10 * ONE),
+            members,
+            failed: false,
+            finished: false,
+        };
+
+        let (found_validator_key, found_member) =
+            election_member_by_source(&current, &proxy_source).expect("member by proxy source");
+
+        assert_eq!(*found_validator_key, validator_key);
+        assert_eq!(found_member.src_addr, proxy_source);
     }
 }
