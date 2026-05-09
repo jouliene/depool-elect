@@ -143,10 +143,14 @@ systemctl --user restart depool-elect
   one expected to reinvest into pooling before the next usable election round.
 - When elections are closed, the service sleeps until the next chain timeline
   boundary instead of polling RPC every minute.
+- If the oldest DePool round is waiting for an elector/proxy callback, such as
+  `WaitingIfStakeAccepted`, ticktock cannot rotate it. The service logs the
+  blocking round and stops spending ticktock gas until the on-chain state
+  changes.
 - Keep enough balance on the validator wallet for DePool deploy, assurance stake,
   DePool/proxy top-ups, ticktocks, and participation messages. The app keeps
-  DePool own balance above 20 TYCHO and tops it up to 30 TYCHO; DePool
-  `balanceThreshold` is logged for diagnostics but is not the ticktock gate.
+  DePool own balance above the greater of 20 TYCHO and the contract's
+  `balanceThreshold`, and tops it up to 30 TYCHO.
 - Default DePool parameters are `min_stake=100` and `validator_assurance=10000`.
 - Re-running `./install.sh` does not overwrite an existing config. If it finds an
   older split-file config, it rewrites it into the single config file format.

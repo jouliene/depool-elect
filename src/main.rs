@@ -38,6 +38,9 @@ const DEFAULT_LOOP_SLEEP_SECS: u64 = 60;
 const WAKE_BEFORE_ELECTIONS_SECS: u32 = 300;
 const ROUND_STEP_POOLING: u8 = 1;
 const ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
+const ROUND_STEP_WAITING_IF_STAKE_ACCEPTED: u8 = 3;
+const ROUND_STEP_WAITING_IF_VALIDATOR_WIN_ELECTIONS: u8 = 5;
+const ROUND_STEP_WAITING_REWARD: u8 = 7;
 const COMPLETION_REASON_FAKE_ROUND: u8 = 2;
 
 #[tokio::main]
@@ -526,7 +529,7 @@ async fn run_once(config_path: &Path) -> Result<u64> {
     let deployed_during_current_election = !was_depool_active && current_election.is_some();
     let depool_balance_was_below_required = depool_balance_topup(
         depool.own_balance,
-        DEPOOL_MIN_BALANCE,
+        depool_min_balance(&depool),
         DEPOOL_TARGET_BALANCE,
     )?
     .is_some();
@@ -750,11 +753,10 @@ async fn maintain_depool_balances(
     depool: &mut DePool,
 ) -> Result<bool> {
     depool.update().await?;
-    if let Some(topup) = depool_balance_topup(
-        depool.own_balance,
-        DEPOOL_MIN_BALANCE,
-        DEPOOL_TARGET_BALANCE,
-    )? {
+    let min_balance = depool_min_balance(depool);
+    if let Some(topup) =
+        depool_balance_topup(depool.own_balance, min_balance, DEPOOL_TARGET_BALANCE)?
+    {
         if wallet_has(
             wallet,
             topup.saturating_add(wallet_reserve(&loaded.config)?),
@@ -763,18 +765,8 @@ async fn maintain_depool_balances(
         {
             log(format!(
                 "depool balance topup value={topup} own_balance={} threshold={} min={} target={}",
-                depool.own_balance,
-                depool.balance_threshold,
-                DEPOOL_MIN_BALANCE,
-                DEPOOL_TARGET_BALANCE
+                depool.own_balance, depool.balance_threshold, min_balance, DEPOOL_TARGET_BALANCE
             ));
-            if depool.own_balance >= DEPOOL_MIN_BALANCE as i128
-                && depool.own_balance < depool.balance_threshold as i128
-            {
-                log(
-                    "depool own balance is below balance_threshold, but ticktock/participate are gated by the lower DePool critical threshold",
-                );
-            }
             let receipt = depool.receive_funds(wallet, topup).await?;
             log_receipt("depool_balance_topup", &receipt);
             depool.update().await?;
@@ -789,7 +781,7 @@ async fn maintain_depool_balances(
     } else {
         log(format!(
             "depool_balance_ready own_balance={} threshold={} min={} target={}",
-            depool.own_balance, depool.balance_threshold, DEPOOL_MIN_BALANCE, DEPOOL_TARGET_BALANCE
+            depool.own_balance, depool.balance_threshold, min_balance, DEPOOL_TARGET_BALANCE
         ));
     }
 
@@ -976,6 +968,14 @@ async fn advance_depool_for_election(
                 "depool target round is fake after ticktock; this usually means DePool was deployed after current elections opened and will rotate for the next election target_round={target_round_log}"
             ));
             return Ok(AdvanceResult::SkippedCurrentElection);
+        }
+
+        if round_waits_for_elector_callback(&rounds[0]) {
+            log(format!(
+                "depool rotation is blocked by old round waiting for elector/proxy callback; ticktock cannot advance this state blocking_round={}",
+                prev_round_log
+            ));
+            return Ok(AdvanceResult::NotReady);
         }
 
         if attempt == UPDATE_ATTEMPTS {
@@ -1231,6 +1231,10 @@ fn depool_balance_topup(
     ))
 }
 
+fn depool_min_balance(depool: &DePool) -> u128 {
+    DEPOOL_MIN_BALANCE.max(depool.balance_threshold as u128)
+}
+
 fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u64) -> u128 {
     participant
         .and_then(|participant| {
@@ -1368,17 +1372,23 @@ async fn account_balance(transport: &Transport, address: &minik2::StdAddr) -> Re
 
 fn format_ready_round(round: &ReadyRound) -> String {
     format!(
-        "{{id={}, supposed_elected_at={}, step={}, stake={}, validator_stake={}}}",
-        round.id, round.supposed_elected_at, round.step, round.stake, round.validator_stake
+        "{{id={}, supposed_elected_at={}, step={}({}), stake={}, validator_stake={}}}",
+        round.id,
+        round.supposed_elected_at,
+        round.step,
+        round_step_name(round.step),
+        round.stake,
+        round.validator_stake
     )
 }
 
 fn format_round(round: &DePoolRound) -> String {
     format!(
-        "{{id={}, supposed_elected_at={}, step={}, stake={}, validator_stake={}, completion_reason={}}}",
+        "{{id={}, supposed_elected_at={}, step={}({}), stake={}, validator_stake={}, completion_reason={}}}",
         round.id,
         round.supposed_elected_at,
         round.step,
+        round_step_name(round.step),
         round.stake,
         round.validator_stake,
         round.completion_reason
@@ -1389,6 +1399,31 @@ fn format_optional_round_id(round_id: Option<u64>) -> String {
     round_id
         .map(|round_id| round_id.to_string())
         .unwrap_or_else(|| "none".to_owned())
+}
+
+fn round_waits_for_elector_callback(round: &DePoolRound) -> bool {
+    matches!(
+        round.step,
+        ROUND_STEP_WAITING_IF_STAKE_ACCEPTED
+            | ROUND_STEP_WAITING_IF_VALIDATOR_WIN_ELECTIONS
+            | ROUND_STEP_WAITING_REWARD
+    )
+}
+
+fn round_step_name(step: u8) -> &'static str {
+    match step {
+        0 => "PrePooling",
+        ROUND_STEP_POOLING => "Pooling",
+        ROUND_STEP_WAITING_VALIDATOR_REQUEST => "WaitingValidatorRequest",
+        ROUND_STEP_WAITING_IF_STAKE_ACCEPTED => "WaitingIfStakeAccepted",
+        4 => "WaitingValidationStart",
+        ROUND_STEP_WAITING_IF_VALIDATOR_WIN_ELECTIONS => "WaitingIfValidatorWinElections",
+        6 => "WaitingUnfreeze",
+        ROUND_STEP_WAITING_REWARD => "WaitingReward",
+        8 => "Completing",
+        9 => "Completed",
+        _ => "Unknown",
+    }
 }
 
 fn format_addresses(addresses: &[minik2::StdAddr]) -> String {
@@ -1509,13 +1544,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn does_not_top_up_above_static_min_even_if_below_contract_balance_threshold() {
+    fn tops_up_when_below_contract_balance_threshold() {
         let own_balance = 23_645_705_112;
+        let threshold = 24_856_342_999;
 
-        let topup = depool_balance_topup(own_balance, DEPOOL_MIN_BALANCE, DEPOOL_TARGET_BALANCE)
-            .expect("topup calculation");
+        let topup = depool_balance_topup(own_balance, threshold, DEPOOL_TARGET_BALANCE)
+            .expect("topup calculation")
+            .expect("topup should be required");
 
-        assert_eq!(topup, None);
+        assert_eq!(topup, 6_354_294_888);
     }
 
     #[test]
