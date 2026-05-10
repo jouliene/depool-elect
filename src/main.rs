@@ -830,6 +830,7 @@ async fn maintain_depool_balances(
 struct ReadyRound {
     id: u64,
     step: u8,
+    completion_reason: u8,
     supposed_elected_at: u32,
     stake: u64,
     validator_stake: u64,
@@ -927,30 +928,22 @@ async fn advance_depool_for_election(
 
     for attempt in 1..=UPDATE_ATTEMPTS {
         depool.update().await?;
-        let rounds = depool.get_rounds();
-        if rounds.len() < 3 {
-            bail!(
-                "DePool rounds number mismatch: expected at least 3, got {}",
-                rounds.len()
-            );
+        if !ensure_pooling_validator_assurance(loaded, wallet, depool, required_stake).await? {
+            return Ok(AdvanceResult::NotReady);
         }
+        depool.update().await?;
 
-        let prev_round_id = rounds[0].id;
-        let target_round = ReadyRound {
-            id: rounds[1].id,
-            step: rounds[1].step,
-            supposed_elected_at: rounds[1].supposed_elected_at,
-            stake: rounds[1].stake,
-            validator_stake: rounds[1].validator_stake,
-        };
-        let target_completion_reason = rounds[1].completion_reason;
-        let pooling_round_id = rounds[2].id;
-        let prev_round_log = format_round(&rounds[0]);
-        let target_round_log = format_round(&rounds[1]);
-        let pooling_round_log = format_round(&rounds[2]);
+        let rounds = depool.get_rounds();
+        let queue = depool_round_queue(rounds)?;
+
+        let selected_target = select_target_round(rounds, queue.target, election_id);
+        let target_round = ready_round_from(selected_target);
+        let prev_round_log = format_round(queue.previous);
+        let target_round_log = format_round(selected_target);
+        let pooling_round_log = format_round(queue.pooling);
         let participant = depool.get_participant_info(wallet.address())?;
-        let pooling_stake = participant_round_stake(participant, pooling_round_id)
-            + participant_round_stake(participant, prev_round_id);
+        let pooling_stake = participant_round_stake(participant, queue.pooling.id)
+            + participant_round_stake(participant, queue.previous.id);
 
         log(format!(
             "depool_update attempt={attempt} election_id={election_id} required_stake={required_stake} pooling_stake={pooling_stake}"
@@ -963,17 +956,25 @@ async fn advance_depool_for_election(
             return Ok(AdvanceResult::Ready(target_round));
         }
 
-        if sent_ticktock && target_completion_reason == COMPLETION_REASON_FAKE_ROUND {
+        if sent_ticktock && target_round.completion_reason == COMPLETION_REASON_FAKE_ROUND {
             log(format!(
                 "depool target round is fake after ticktock; this usually means DePool was deployed after current elections opened and will rotate for the next election target_round={target_round_log}"
             ));
             return Ok(AdvanceResult::SkippedCurrentElection);
         }
 
-        if round_waits_for_elector_callback(&rounds[0]) {
+        if round_blocks_rotation_for_election(queue.previous, election_id) {
             log(format!(
-                "depool rotation is blocked by old round waiting for elector/proxy callback; ticktock cannot advance this state blocking_round={}",
-                prev_round_log
+                "depool rotation is blocked by old round waiting for elector/proxy callback; ticktock cannot advance this state blocking_round={} target_round={}",
+                prev_round_log, target_round_log
+            ));
+            return Ok(AdvanceResult::NotReady);
+        }
+
+        if round_blocks_rotation_for_election(selected_target, election_id) {
+            log(format!(
+                "depool target round is waiting for elector/proxy callback from an older election; ticktock cannot make it ready blocking_round={}",
+                target_round_log
             ));
             return Ok(AdvanceResult::NotReady);
         }
@@ -1372,13 +1373,14 @@ async fn account_balance(transport: &Transport, address: &minik2::StdAddr) -> Re
 
 fn format_ready_round(round: &ReadyRound) -> String {
     format!(
-        "{{id={}, supposed_elected_at={}, step={}({}), stake={}, validator_stake={}}}",
+        "{{id={}, supposed_elected_at={}, step={}({}), stake={}, validator_stake={}, completion_reason={}}}",
         round.id,
         round.supposed_elected_at,
         round.step,
         round_step_name(round.step),
         round.stake,
-        round.validator_stake
+        round.validator_stake,
+        round.completion_reason
     )
 }
 
@@ -1399,6 +1401,59 @@ fn format_optional_round_id(round_id: Option<u64>) -> String {
     round_id
         .map(|round_id| round_id.to_string())
         .unwrap_or_else(|| "none".to_owned())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DePoolRoundQueue<'a> {
+    previous: &'a DePoolRound,
+    target: &'a DePoolRound,
+    pooling: &'a DePoolRound,
+}
+
+fn depool_round_queue(rounds: &[DePoolRound]) -> Result<DePoolRoundQueue<'_>> {
+    if rounds.len() < 3 {
+        bail!(
+            "DePool rounds number mismatch: expected at least 3, got {}",
+            rounds.len()
+        );
+    }
+
+    Ok(DePoolRoundQueue {
+        previous: &rounds[0],
+        target: &rounds[1],
+        pooling: rounds
+            .iter()
+            .find(|round| round.step == ROUND_STEP_POOLING)
+            .unwrap_or(&rounds[2]),
+    })
+}
+
+fn select_target_round<'a>(
+    rounds: &'a [DePoolRound],
+    queue_target: &'a DePoolRound,
+    election_id: u32,
+) -> &'a DePoolRound {
+    rounds
+        .iter()
+        .find(|round| round.supposed_elected_at == election_id)
+        .unwrap_or(queue_target)
+}
+
+fn ready_round_from(round: &DePoolRound) -> ReadyRound {
+    ReadyRound {
+        id: round.id,
+        step: round.step,
+        completion_reason: round.completion_reason,
+        supposed_elected_at: round.supposed_elected_at,
+        stake: round.stake,
+        validator_stake: round.validator_stake,
+    }
+}
+
+fn round_blocks_rotation_for_election(round: &DePoolRound, election_id: u32) -> bool {
+    round.supposed_elected_at != 0
+        && round.supposed_elected_at < election_id
+        && round_waits_for_elector_callback(round)
 }
 
 fn round_waits_for_elector_callback(round: &DePoolRound) -> bool {
@@ -1607,5 +1662,53 @@ mod tests {
 
         assert_eq!(*found_validator_key, validator_key);
         assert_eq!(found_member.src_addr, proxy_source);
+    }
+
+    #[test]
+    fn detects_old_round_waiting_for_elector_callback_as_rotation_blocker() {
+        let round = depool_round(2, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, 1_000, 100);
+
+        assert!(round_blocks_rotation_for_election(&round, 200));
+        assert!(!round_blocks_rotation_for_election(&round, 100));
+        assert!(!round_blocks_rotation_for_election(
+            &depool_round(2, ROUND_STEP_WAITING_VALIDATOR_REQUEST, 1_000, 100),
+            200
+        ));
+    }
+
+    #[test]
+    fn selects_round_already_configured_for_current_election_before_queue_target() {
+        let rounds = vec![
+            depool_round(2, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, 1_000, 100),
+            depool_round(3, ROUND_STEP_WAITING_IF_STAKE_ACCEPTED, 1_000, 200),
+            depool_round(4, ROUND_STEP_WAITING_VALIDATOR_REQUEST, 1_000, 300),
+            depool_round(5, ROUND_STEP_POOLING, 0, 0),
+        ];
+        let queue = depool_round_queue(&rounds).expect("round queue");
+
+        let selected = select_target_round(&rounds, queue.target, 300);
+
+        assert_eq!(selected.id, 4);
+    }
+
+    fn depool_round(id: u64, step: u8, stake: u64, supposed_elected_at: u32) -> DePoolRound {
+        DePoolRound {
+            id,
+            supposed_elected_at,
+            unfreeze: 0,
+            stake_held_for: 0,
+            vset_hash_in_election_phase: 0,
+            step,
+            completion_reason: 0,
+            stake,
+            recovered_stake: 0,
+            unused: 0,
+            is_validator_stake_completed: false,
+            participant_reward: 0,
+            participant_qty: 0,
+            validator_stake: stake,
+            validator_remaining_stake: 0,
+            handled_stakes_and_rewards: 0,
+        }
     }
 }
